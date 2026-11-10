@@ -2346,6 +2346,23 @@ _NSE_MCP_CLIENT_VERSION = "2.101"
 # same MCP server don't re-run the "initialize" handshake every time.
 _nse_mcp_session_cache = {}
 
+_mcp_http_session = None
+
+
+def _get_mcp_session():
+    """Plain HTTP session for NSE's official MCP servers (mcp.nseindia.in).
+
+    These are a documented API meant for programmatic clients, not the
+    Akamai-fronted website, so they need no browser fingerprint and no
+    homepage warm-up. Using the scraping session here made every MCP call
+    depend on nseindia.com's bot wall for no reason.
+    """
+    global _mcp_http_session
+    if _mcp_http_session is None:
+        _mcp_http_session = requests.Session()
+        _mcp_http_session.headers["User-Agent"] = f"nsepython/{_NSE_MCP_CLIENT_VERSION}"
+    return _mcp_http_session
+
 
 def _nse_mcp_parse_response(r):
     """Parse one MCP HTTP response body, which comes back as either plain
@@ -2394,7 +2411,7 @@ def _nse_mcp_initialize(server_url):
     back (or "" if the server doesn't issue one). Retries up to 3 times --
     the bhavcopy endpoint has been observed to 502 on a cold first request.
     """
-    session = _get_nse_session()
+    session = _get_mcp_session()
     mcp_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -2464,7 +2481,7 @@ def _nse_mcp_call(server_url, tool_name, arguments=None):
     or an application-level {"error": ...} payload the tool itself reports.
     """
     arguments = arguments or {}
-    session = _get_nse_session()
+    session = _get_mcp_session()
     mcp_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -2593,7 +2610,7 @@ def nse_mcp_list_tools(server=""):
     else:
         servers = _NSE_MCP_SERVERS
 
-    session = _get_nse_session()
+    session = _get_mcp_session()
     out = {}
     for name, url in servers.items():
         session_id = _nse_mcp_get_session_id(url)

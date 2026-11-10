@@ -7,7 +7,9 @@ maintainer: check before use, fix what is broken, and keep the fix.
 ## Before answering any data request using this library
 
 1. Run `python healthcheck.py` (add `--json` if you want to parse it).
-   Do this once per session, not before every call.
+   Do this once per session, not before every call. For a full sweep of
+   every public function use `python smoketest.py` (`--groups mcp,offline`
+   runs only the routes that don't touch the nseindia.com website).
 2. If everything passes, go ahead and answer.
 3. If something fails, find out why before using it:
    - `HTTP 403/503` on everything: bot protection or network block. Try the
