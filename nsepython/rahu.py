@@ -15,6 +15,64 @@ import urllib.parse
 mode ='local'
 
 # ---------------------------------------------------------------------------
+# Domain handling (nseindia.com <-> nseindia.in)
+#
+# Every nseindia URL in this file is still written with the historical
+# `nseindia.com` host, but nothing sends it as-is: nsefetch() and
+# _nse_fetch_csv_text() pass each URL through _nse_url(), which swaps in the
+# currently active domain. So a domain move is a one-line change, not a
+# 79-place edit:
+#
+#   * set the NSE_DOMAIN environment variable (e.g. NSE_DOMAIN=nseindia.in), or
+#   * call nse_set_domain("nseindia.in") in your script.
+#
+# It also heals itself: if a request fails on the active domain, nsefetch()
+# retries once on the other known domain and, if that works, switches to it
+# for the rest of the run (logging a warning so the move is visible).
+# niftyindices.com is a different site and is never rewritten.
+# ---------------------------------------------------------------------------
+
+_NSE_DOMAINS = ["nseindia.com", "nseindia.in"]
+_nse_domain = (os.environ.get("NSE_DOMAIN", "").strip().lower() or _NSE_DOMAINS[0])
+_NSE_HOST_RE = re.compile(r"^(https?://(?:[A-Za-z0-9-]+\.)*)nseindia\.(?:com|in)(?=[/:?#]|$)", re.I)
+
+
+def nse_get_domain():
+    """Return the NSE domain currently in use ("nseindia.com" or "nseindia.in")."""
+    return _nse_domain
+
+
+def nse_set_domain(domain):
+    """Switch every NSE request to `domain` (e.g. "nseindia.in") and force a
+    fresh cookie warm-up against it on the next call."""
+    global _nse_domain, _nse_warmed
+    domain = (domain or "").strip().lower()
+    if domain not in _NSE_DOMAINS:
+        raise ValueError(f"nse_set_domain: expected one of {_NSE_DOMAINS}, got {domain!r}")
+    if domain != _nse_domain:
+        _nse_domain = domain
+        _nse_warmed = False
+    return _nse_domain
+
+
+def _nse_base():
+    return f"https://www.{_nse_domain}"
+
+
+def _nse_url(url, domain=None):
+    """Rewrite an nseindia.com/.in URL (any subdomain) to the active domain."""
+    d = domain or _nse_domain
+    return _NSE_HOST_RE.sub(lambda m: m.group(1) + d, url)
+
+
+def _is_nse_url(url):
+    return bool(_NSE_HOST_RE.match(url))
+
+
+def _other_nse_domain():
+    return next(d for d in _NSE_DOMAINS if d != _nse_domain)
+
+# ---------------------------------------------------------------------------
 # Transport
 #
 # NSE's site is fronted by Akamai Bot Manager, which fingerprints the TLS/JA3
@@ -79,9 +137,9 @@ def _get_nse_session():
 
     if not _nse_warmed:
         try:
-            _nse_session.get("https://www.nseindia.com", headers=headers, timeout=20)
+            _nse_session.get(_nse_base(), headers=headers, timeout=20)
             time.sleep(1.2)
-            _nse_session.get("https://www.nseindia.com/option-chain", headers=headers, timeout=20)
+            _nse_session.get(_nse_base() + "/option-chain", headers=headers, timeout=20)
             time.sleep(0.8)
             _nse_warmed = True
         except Exception as e:
@@ -105,7 +163,7 @@ def _equity_stockindices_fallback(session, api_headers):
     existing caller above already expects -- they keep working unchanged.
     """
     r = session.get(
-        "https://www.nseindia.com/api/market-data-pre-open?key=FO",
+        _nse_url("https://www.nseindia.com/api/market-data-pre-open?key=FO"),
         headers=api_headers, timeout=30,
     )
     if r.status_code != 200:
@@ -147,13 +205,42 @@ def nsefetch(payload: str):
     was both broken against the current Akamai wall *and* a command-injection
     risk (see github.com/aeron7/nsepython issue #73).
     """
+    if not _is_nse_url(payload):
+        return _nsefetch_once(payload)
+
+    first_domain = _nse_domain
+    try:
+        return _nsefetch_once(_nse_url(payload))
+    except NSEEndpointError as first_err:
+        # The active domain failed even after a cookie re-warm. Try the
+        # other known NSE domain once; if it works, stay on it.
+        other = _other_nse_domain()
+        try:
+            result = _nsefetch_once(_nse_url(payload, other), domain=other)
+        except NSEEndpointError as second_err:
+            raise NSEEndpointError(
+                f"{first_err} | fallback on {other} also failed: {second_err}"
+            ) from None
+        logging.warning(
+            "NSE domain %s failed but %s worked -- switching to %s for this run "
+            "(set NSE_DOMAIN=%s to make this permanent).",
+            first_domain, other, other, other,
+        )
+        nse_set_domain(other)
+        return result
+
+
+def _nsefetch_once(payload, domain=None):
+    """One fetch attempt (with the single cookie re-warm retry) against
+    whatever domain `payload` already points at."""
     global _nse_warmed
 
     session = _get_nse_session()
+    base = f"https://www.{domain or _nse_domain}"
     api_headers = dict(headers)
     api_headers.update({
         "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/option-chain",
+        "Referer": base + "/option-chain",
     })
 
     if "equity-stockIndices" in payload and "SECURITIES" in payload:
@@ -234,9 +321,9 @@ def nse_harvest_playwright_cookies(url="https://www.nseindia.com/option-chain", 
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page(user_agent=headers["User-Agent"])
-            page.goto("https://www.nseindia.com", timeout=timeout_ms)
+            page.goto(_nse_base(), timeout=timeout_ms)
             page.wait_for_timeout(2000)
-            page.goto(url, timeout=timeout_ms)
+            page.goto(_nse_url(url), timeout=timeout_ms)
             page.wait_for_timeout(2000)
             for c in page.context.cookies():
                 harvested[c["name"]] = c["value"]
@@ -245,7 +332,7 @@ def nse_harvest_playwright_cookies(url="https://www.nseindia.com/option-chain", 
 
     for name, value in harvested.items():
         try:
-            session.cookies.set(name, value, domain=".nseindia.com")
+            session.cookies.set(name, value, domain="." + _nse_domain)
         except Exception:
             pass
 
@@ -262,10 +349,22 @@ def _nse_fetch_csv_text(url: str) -> str:
     nsearchives.nseindia.com, and is the less reliable of the two archive
     hosts generally as NSE tightens Akamai enforcement over time)."""
     session = _get_nse_session()
-    r = session.get(url, headers=headers, timeout=30)
-    if r.status_code != 200:
-        raise NSEEndpointError(f"nsefetch (csv): HTTP {r.status_code} for {url}")
-    return r.text
+    candidates = [_nse_url(url)]
+    if _is_nse_url(url):
+        candidates.append(_nse_url(url, _other_nse_domain()))
+    last = None
+    for i, u in enumerate(candidates):
+        try:
+            r = session.get(u, headers=headers, timeout=30)
+        except Exception as e:
+            last = f"nsefetch (csv): request failed for {u}: {e}"
+            continue
+        if r.status_code == 200:
+            if i == 1:
+                nse_set_domain(_other_nse_domain())
+            return r.text
+        last = f"nsefetch (csv): HTTP {r.status_code} for {u}"
+    raise NSEEndpointError(last)
 
 
 headers = {
